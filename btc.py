@@ -50,24 +50,6 @@ RANGE = 0.04       # 观察窗口
 
 def px():
     return float(requests.get("https://blockchain.info/ticker", timeout=10).json()["USD"]["last"])
-    except Exception:
-        pass
-
-    try:
-        j = requests.get(
-            "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT", timeout=15
-        ).json()
-        return float(j["price"])
-    except Exception:
-        pass
-
-    try:
-        j = requests.get("https://api.coinbase.com/v2/prices/BTC-USD/spot", timeout=15).json()
-        return float(j["data"]["amount"])
-    except Exception:
-        pass
-
-    raise RuntimeError("所有取价源均失败")
 
 
 def hook():
