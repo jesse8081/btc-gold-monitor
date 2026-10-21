@@ -49,17 +49,7 @@ RANGE = 0.04       # 观察窗口
 
 
 def px():
-    # 主源：新浪（国内快）；兜底：Binance / Coinbase（海外 IP 可用）
-    try:
-        r = requests.get(
-            "https://hq.sinajs.cn/list=fx_sbtcusd",
-            headers={"Referer": "https://finance.sina.com.cn", "User-Agent": "Mozilla/5.0"},
-            timeout=15,
-        )
-        r.encoding = "gbk"
-        body = r.text.split('"')[1] if '"' in r.text else ""
-        if body.count(",") >= 5:
-            return float(body.split(",")[1])
+    return float(requests.get("https://blockchain.info/ticker", timeout=10).json()["USD"]["last"])
     except Exception:
         pass
 
