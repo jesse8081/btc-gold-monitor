@@ -1,0 +1,33 @@
+name: basis-daily
+
+on:
+  schedule:
+    - cron: "10 7 * * 1-5"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: basis-daily
+  cancel-in-progress: false
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: 生成贴水日报
+        run: python track_basis.py
+      - name: 提交报告
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add reports
+          if git diff --staged --quiet; then exit 0; fi
+          git commit -m "basis: $(date -u +%F)"
+          git push
