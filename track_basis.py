@@ -93,6 +93,26 @@ def fetch_spot_daily(code, limit=400):
     return {r["day"]: float(r["close"]) for r in rows if r.get("day")}
 
 
+def fetch_spot_realtime(code):
+    """现货指数实时价 -> float；收盘后（15:00 之后）即为当日收盘价。
+
+    用于当日日线尚未发布时的兜底，避免 15:10 跑出来只是 SKIP、报告却没生成。
+    """
+    text = http_get(f"https://hq.sinajs.cn/list={code}",
+                    referer="https://finance.sina.com.cn", encoding="gbk")
+    m = re.search(r'"([^"]*)"', text)
+    if not m:
+        return None
+    f = m.group(1).split(",")
+    if len(f) < 4:
+        return None
+    try:
+        v = float(f[3])
+    except (TypeError, ValueError):
+        return None
+    return v if v > 0 else None
+
+
 def fetch_contract_daily(symbol):
     """单合约日线 -> {date_str: (close, oi, vol)}
 
@@ -259,7 +279,19 @@ def build_report(target, lookback):
             errors.append(f"{product} 现货数据为空")
             continue
         if tgt not in spot_map:
-            return None, [f"{tgt} 无现货收盘（非交易日或数据未就绪）"]
+            # 当日日线还没发布（15:10 跑时常见）→ 用实时价兜底，仅在收盘后启用
+            filled = False
+            if target == today_cn() and datetime.now(CN_TZ).hour * 60 + datetime.now(CN_TZ).minute >= 15 * 60:
+                try:
+                    v = fetch_spot_realtime(spot_code)
+                except Exception:                    # noqa: BLE001
+                    v = None
+                if v:
+                    spot_map[tgt] = v
+                    filled = True
+                    errors.append(f"{product} 现货日线未更新，已用 {v:.2f} 兜底（收盘后实时价）")
+            if not filled:
+                return None, [f"{tgt} 无现货收盘（非交易日或数据未就绪）"]
 
         spot = spot_map[tgt]
         chain = listed_contracts(target, product)
