@@ -29,26 +29,46 @@ import json
 import os
 import re
 import sys
+import time
+import traceback
 import urllib.request
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 CFFEX_PRODUCTS = [
-    # code, 现货名称, 现货代码, 现货日线备用
+    # code, 现货名称, 现货代码
     ("IC", "中证500", "sh000905"),
     ("IM", "中证1000", "sh000852"),
 ]
 LOOKBACK_DAYS = 60           # 年化贴水深度分位的回看交易日数
+CN_TZ = timezone(timedelta(hours=8))
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
 
 
-def http_get(url, referer=None, encoding="utf-8", timeout=20):
-    req = urllib.request.Request(url, headers={"User-Agent": UA})
-    if referer:
-        req.add_header("Referer", referer)
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        raw = r.read()
-    return raw.decode(encoding, errors="replace")
+def today_cn():
+    """服务器多为 UTC，按北京时间取当日，避免跨零点算错日期"""
+    return datetime.now(CN_TZ).date()
+
+
+def http_get(url, referer=None, encoding="utf-8", timeout=20, retries=3):
+    """带重试；非 2xx / 超时 / 空响应都会重试，最终抛最后一次异常。"""
+    last = None
+    for i in range(retries):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": UA})
+            if referer:
+                req.add_header("Referer", referer)
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                raw = r.read()
+            if not raw:
+                raise ValueError("空响应")
+            return raw.decode(encoding, errors="replace")
+        except Exception as e:                       # noqa: BLE001
+            last = e
+            if i < retries - 1:
+                time.sleep(1.5 * (i + 1))
+    raise last
+
 
 
 # ---------------------------------------------------------------- 数据获取
@@ -74,15 +94,27 @@ def fetch_spot_daily(code, limit=400):
 
 
 def fetch_contract_daily(symbol):
-    """单合约日线 -> {date_str: (close, oi, vol)}"""
+    """单合约日线 -> {date_str: (close, oi, vol)}
+
+    新浪在部分网络（如境外 runner）会返回 null / 空 / 非 JSON，一律按空处理，
+    由调用方决定降级，不能让单合约把整个进程打挂。
+    """
     url = ("https://stock2.finance.sina.com.cn/futures/api/jsonp.php/var%20_"
            f"{symbol}=/InnerFuturesNewService.getDailyKLine?symbol={symbol}")
     text = http_get(url)
     m = re.search(r"\((.*)\)\s*;?\s*$", text.strip(), re.S)
     if not m:
         return {}
+    try:
+        rows = json.loads(m.group(1))
+    except (ValueError, TypeError):
+        return {}
+    if not isinstance(rows, list):
+        return {}
     out = {}
-    for r in json.loads(m.group(1)):
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
         d, c = r.get("d"), r.get("c")
         if not d or not c:
             continue
@@ -231,27 +263,37 @@ def build_report(target, lookback):
 
         spot = spot_map[tgt]
         chain = listed_contracts(target, product)
-        daily = {c: fetch_contract_daily(c) for c, _ in chain}
+        codes = [c for c, _ in chain]
 
-        # 当日快照：优先日线，缺失回落到实时快照（仅目标日为今天时）
-        snap = {}
-        if any(tgt not in d for d in daily.values()) and target == date.today():
+        # 当日行情：目标日是今天 → 优先一次快照拿全 4 个合约（价 / 持仓 / 成交）；
+        # 补历史日期时快照无效，只能逐合约取日线。
+        snap, daily, failed = {}, {}, []
+        if target == today_cn():
             try:
-                snap = fetch_snapshot([c for c, _ in chain])
-            except Exception:
-                snap = {}
-        for code, _exp in chain:
+                snap.update(fetch_snapshot(codes))
+            except Exception as e:                   # noqa: BLE001
+                failed.append(f"snapshot({type(e).__name__})")
+
+        for code in codes:
+            if code in snap:
+                continue
+            try:
+                time.sleep(0.25)                     # 避免连续请求触发限流
+                daily[code] = fetch_contract_daily(code)
+            except Exception as e:                   # noqa: BLE001
+                daily[code] = {}
+                failed.append(f"{code}({type(e).__name__})")
             if tgt in daily[code]:
                 snap[code] = daily[code][tgt]
 
         if not snap:
-            errors.append(f"{product} 未取到合约行情")
+            errors.append(f"{product} 未取到合约行情" + (f"，失败: {', '.join(failed)}" if failed else ""))
             continue
+        if failed:
+            errors.append(f"{product} 部分数据失败: {', '.join(failed)}")
 
-        main_code, main_exp = max(chain, key=lambda ce: snap.get(ce[0], (0, 0, 0))[1])
-        if main_code not in snap:
-            errors.append(f"{product} 主力合约无行情")
-            continue
+        main_code, main_exp = max((ce for ce in chain if ce[0] in snap),
+                                  key=lambda ce: snap[ce[0]][1])
 
         rows_chain = []
         for code, exp in chain:
@@ -265,9 +307,26 @@ def build_report(target, lookback):
                 "rate": rate, "ann": annualize(rate, days), "oi": oi, "vol": vol,
             })
 
+        # 移仓目标：下季合约（链上第 3 个）
+        target_row = rows_chain[2] if len(rows_chain) >= 3 else None
+
+        # 历史序列只对「主力」和「目标」两个合约取日线（省请求、降限流风险）
+        n_failed = len(failed)
+        for code in {main_code, target_row["code"] if target_row else main_code}:
+            if code in daily:
+                continue
+            try:
+                time.sleep(0.25)
+                daily[code] = fetch_contract_daily(code)
+            except Exception as e:                   # noqa: BLE001
+                daily[code] = {}
+                failed.append(f"{code}历史({type(e).__name__})")
+        if len(failed) > n_failed:
+            errors.append(f"{product} 历史数据缺失: {', '.join(failed[n_failed:])}")
+
         # 主力合约的自身年化序列（近 N 日）
         main_row = next(r for r in rows_chain if r["code"] == main_code)
-        series = per_contract_series(daily[main_code], spot_map, main_exp, tgt, lookback)
+        series = per_contract_series(daily.get(main_code, {}), spot_map, main_exp, tgt, lookback)
         cur_ann = main_row["ann"]
         pct = depth_percentile(cur_ann, [a for _, a in series])
         prev_ann = next((a for d, a in reversed(series) if d < tgt), None)
@@ -276,17 +335,19 @@ def build_report(target, lookback):
         spot_prev = next((spot_map[d] for d in sorted(spot_map, reverse=True) if d < tgt), None)
         spot_chg = (spot / spot_prev - 1) if spot_prev else None   # 小数，渲染时再转百分比
 
-        # 移仓目标：下季合约（链上第 3 个）
-        target_row = rows_chain[2] if len(rows_chain) >= 3 else None
         tgt_pct = tgt_series = None
         if target_row:
             tgt_series = per_contract_series(
-                daily[target_row["code"]], spot_map, target_row["exp"], tgt, lookback)
+                daily.get(target_row["code"], {}), spot_map, target_row["exp"], tgt, lookback)
             tgt_pct = depth_percentile(target_row["ann"], [a for _, a in tgt_series])
             gap = target_row["days"] - main_row["days"]
             spread = (main_row["close"] - target_row["close"]) / main_row["close"]
             target_row["spread"] = spread
             target_row["spread_ann"] = annualize(spread, gap)
+
+        if cur_ann is None:
+            errors.append(f"{product} 主力合约年化无法计算（剩余天数 {main_row['days']}）")
+            continue
 
         products.append({
             "product": product, "spot_name": spot_name, "spot": spot,
@@ -325,7 +386,7 @@ def render(target, products, lookback):
         L.append(f"今日 {names} 中 {d['product']} 贴水偏深（深度分位 {d['pct']:.0f}%），"
                  f"{d['advice']}。")
     else:
-        bits = "、".join(f"{p['product']} {p['pct']:.0f}%" for p in products if p["pct"] is not None)
+        bits = "、".join(f"{p['product']} {p['pct']:.0f}%" for p in products if p["pct"] is not None) or "分位数据不足"
         L.append(f"今日 {names} 贴水均处中性区间（{bits}），无明确移仓信号。")
     L.append("")
 
@@ -349,10 +410,14 @@ def render(target, products, lookback):
     L.append("| 品种 | 当前 | 最浅 | 中位 | 最深 | 深度分位 |")
     L.append("|---|---|---|---|---|---|")
     for p in products:
-        L.append(f"| {p['product']} | {_pct(p['main']['ann'], True)} | {_pct(p['hist_max'], True)} | "
-                 f"{_pct(p['hist_med'], True)} | {_pct(p['hist_min'], True)} | "
-                 f"{bar(p['pct'])} {p['pct']:.0f}% |" if p["pct"] is not None else
-                 f"| {p['product']} | n/a | n/a | n/a | n/a | n/a |")
+        if p["pct"] is None:
+            L.append(f"| {p['product']} | {_pct(p['main']['ann'], True)} | "
+                     f"{_pct(p['hist_max'], True)} | {_pct(p['hist_med'], True)} | "
+                     f"{_pct(p['hist_min'], True)} | n/a |")
+        else:
+            L.append(f"| {p['product']} | {_pct(p['main']['ann'], True)} | {_pct(p['hist_max'], True)} | "
+                     f"{_pct(p['hist_med'], True)} | {_pct(p['hist_min'], True)} | "
+                     f"{bar(p['pct'])} {p['pct']:.0f}% |")
     L += ["", "", "分位线均为年化贴水取值，越负代表贴水越深。深度分位越高 = 当前贴水相对近"
           f"{lookback}日越极端（对多头越有利）。", ""]
 
@@ -397,8 +462,11 @@ def render(target, products, lookback):
         sp = (f"{t['spread'] * 100:+.2f}%（{t['spread_ann'] * 100:+.1f}%）"
               if t.get("spread") is not None else "n/a")
         tp = f"{p['target_pct']:.0f}%" if p["target_pct"] is not None else "n/a"
-        L.append(f"| {p['product']} | {p['main']['code']} | {abs(p['main']['ann']) * 100:.1f}% | "
-                 f"{p['pct']:.0f}% | {t['code']} | {abs(t['ann']) * 100:.1f}% | "
+        mp = f"{p['pct']:.0f}%" if p["pct"] is not None else "n/a"
+        ma = f"{abs(p['main']['ann']) * 100:.1f}%" if p["main"]["ann"] is not None else "n/a"
+        ta = f"{abs(t['ann']) * 100:.1f}%" if t["ann"] is not None else "n/a"
+        L.append(f"| {p['product']} | {p['main']['code']} | {ma} | "
+                 f"{mp} | {t['code']} | {ta} | "
                  f"{tp} | {sp} | {p['advice']} |")
     L += ["", ""]
 
@@ -449,7 +517,7 @@ def main():
     args = ap.parse_args()
 
     target = (datetime.strptime(args.date, "%Y-%m-%d").date()
-              if args.date else date.today())
+              if args.date else today_cn())
     path = os.path.join(args.outdir, target.strftime("%Y-%m-%d") + ".md")
 
     # 先建目录：即使当日 SKIP 也要让 reports/ 存在，
@@ -460,10 +528,19 @@ def main():
         print(f"SKIP 报告已存在: {path}")
         return 0
 
-    products, errors = build_report(target, args.lookback)
+    try:
+        products, errors = build_report(target, args.lookback)
+    except Exception as e:                           # noqa: BLE001
+        print(f"FAIL {target} 生成失败: {type(e).__name__}: {e}")
+        traceback.print_exc()
+        return 1
     if not products:
-        print("SKIP " + "；".join(errors or ["无可用数据"]))
-        return 0
+        msg = "；".join(errors or ["无可用数据"])
+        if any("无现货收盘" in e for e in errors):
+            print("SKIP " + msg)          # 非交易日 / 数据未就绪
+            return 0
+        print("FAIL " + msg)              # 数据源异常：要让 CI 变红，不能静默
+        return 1
 
     with open(path, "w", encoding="utf-8") as f:
         f.write(render(target, products, args.lookback))
