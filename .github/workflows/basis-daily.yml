@@ -4,6 +4,10 @@ on:
   schedule:
     - cron: "10 7 * * 1-5"
   workflow_dispatch:
+    inputs:
+      date:
+        description: "补历史日期 YYYY-MM-DD（留空=今天；填了就强制重算）"
+        required: false
 
 permissions:
   contents: write
@@ -22,12 +26,22 @@ jobs:
         with:
           python-version: "3.11"
       - name: 生成贴水日报
-        run: python track_basis.py
+        env:
+          IN_DATE: ${{ inputs.date }}
+        run: |
+          if [ -n "$IN_DATE" ]; then
+            python track_basis.py --date "$IN_DATE" --force
+          else
+            python track_basis.py
+          fi
       - name: 提交报告
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add reports
-          if git diff --staged --quiet; then exit 0; fi
+          if [ -d reports ]; then git add -A reports; fi
+          if git diff --staged --quiet; then
+            echo "无新报告（非交易日或报告已存在）"
+            exit 0
+          fi
           git commit -m "basis: $(date -u +%F)"
           git push
