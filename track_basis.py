@@ -276,6 +276,10 @@ def main():
               if args.date else date.today())
     path = os.path.join(args.outdir, target.strftime("%Y-%m-%d") + ".md")
 
+    # 先建目录：即使当日 SKIP，也要保证 reports/ 存在，
+    # 否则 CI 里 `git add reports` 会因 pathspec 不存在直接 exit 128。
+    os.makedirs(args.outdir, exist_ok=True)
+
     if os.path.exists(path) and not args.force:
         print(f"SKIP 报告已存在: {path}")
         return 0
@@ -285,7 +289,6 @@ def main():
         print("SKIP " + "；".join(errors or ["无可用数据"]))
         return 0
 
-    os.makedirs(args.outdir, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         f.write(render(target, rows))
     for e in errors:
