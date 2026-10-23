@@ -32,15 +32,29 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: 拉取仓库（含当日报告）
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: main
           fetch-depth: 1
 
       - name: 安装 Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.11"
+
+      - name: 检查凭证是否已配置
+        env:
+          IMA_CLIENT_ID: ${{ secrets.IMA_CLIENT_ID }}
+          IMA_API_KEY: ${{ secrets.IMA_API_KEY }}
+        run: |
+          MISSING=""
+          if [ -z "$IMA_CLIENT_ID" ]; then MISSING="IMA_CLIENT_ID"; fi
+          if [ -z "$IMA_API_KEY" ]; then MISSING="${MISSING:+$MISSING, }IMA_API_KEY"; fi
+          if [ -n "$MISSING" ]; then
+            echo "::error::仓库 Secrets 缺少：$MISSING。请到 Settings → Secrets and variables → Actions 添加后重跑。"
+            exit 1
+          fi
+          echo "凭证已注入：Client ID 长度 ${#IMA_CLIENT_ID}，API Key 长度 ${#IMA_API_KEY}"
 
       - name: 归档到 IMA
         env:

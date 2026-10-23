@@ -46,10 +46,30 @@ def log(msg):
     print(msg, flush=True)
 
 
+def summary(lines):
+    """写了 GITHUB_STEP_SUMMARY 时，运行摘要会直接显示在 Actions 页面。"""
+    path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not path:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")
+    except Exception:
+        pass
+
+
 def _creds():
     cid = (os.environ.get("IMA_CLIENT_ID") or "").strip()
     key = (os.environ.get("IMA_API_KEY") or "").strip()
     if not cid or not key:
+        summary(
+            [
+                "## 归档未执行：缺少凭证",
+                "",
+                "缺少 IMA_CLIENT_ID / IMA_API_KEY。"
+                "请到仓库 Settings → Secrets and variables → Actions 添加，然后重跑。",
+            ]
+        )
         raise SystemExit(
             "缺少 IMA 凭证：请在仓库 Settings → Secrets and variables → Actions "
             "里添加 IMA_CLIENT_ID 和 IMA_API_KEY"
@@ -68,21 +88,33 @@ def ima_api(path, body, retries=4):
     }
     last_err = None
     for attempt in range(1, retries + 1):
-        req = urllib.request.Request(IMA_BASE + path, data=payload, headers=headers, method="POST")
+        req = urllib.request.Request(
+            f"{IMA_BASE}/{path.lstrip('/')}", data=payload, headers=headers, method="POST"
+        )
         try:
             with urllib.request.urlopen(req, timeout=60) as resp:
                 raw = resp.read().decode("utf-8", "replace")
         except urllib.error.HTTPError as exc:
-            last_err = f"HTTP {exc.code}"
+            try:
+                raw_err = exc.read().decode("utf-8", "replace")
+            except Exception:
+                raw_err = ""
             if exc.code >= 500 and attempt < retries:
                 time.sleep(3 * attempt)
                 continue
-            detail = ""
+            msg = ""
             try:
-                detail = exc.read().decode("utf-8", "replace")[:300]
+                msg = json.loads(raw_err).get("msg") or ""
             except Exception:
                 pass
-            raise RuntimeError(f"{path} {last_err} {detail}") from None
+            hint = ""
+            if exc.code in (401, 403):
+                hint = "（凭证无效或未授权，去 ima.qq.com/agent-interface 重新生成 API Key）"
+            elif exc.code == 404:
+                hint = "（接口路径不存在，检查 IMA_BASE 是否拼错）"
+            raise RuntimeError(
+                f"{path} HTTP {exc.code}{hint} {msg or raw_err[:200]}".strip()
+            ) from None
         except Exception as exc:  # 网络抖动
             last_err = str(exc)
             if attempt < retries:
@@ -343,23 +375,35 @@ def main():
     if args.dry_run:
         kb_id, titles = "(dry-run)", set()
     else:
-        kb_id = resolve_kb_id(args.kb_name)
+        try:
+            kb_id = resolve_kb_id(args.kb_name)
+        except Exception as exc:
+            log(f"! 解析知识库失败: {exc}")
+            summary([f"## 归档失败", "", f"解析知识库「{args.kb_name}」失败：{exc}"])
+            return 1
         log(f"目标知识库「{args.kb_name}」")
         titles = existing_titles(kb_id)
 
     added = skipped = 0
     failed = []
+    rows = []
     for date_str, text in reports:
         try:
             result = archive_one(kb_id, date_str, text, titles, dry_run=args.dry_run)
             added += result == "added"
             skipped += result == "skipped"
+            rows.append((date_str, "已新增" if result == "added" else "已存在，跳过"))
         except Exception as exc:
             failed.append((date_str, str(exc)))
+            rows.append((date_str, f"失败：{exc}"))
             log(f"  ! {date_str} 归档失败: {exc}")
 
     log("")
     log(f"完成：新增 {added} 篇，跳过 {skipped} 篇，失败 {len(failed)} 篇")
+    summary(
+        [f"## IMA 归档结果：新增 {added} / 跳过 {skipped} / 失败 {len(failed)}", "", "| 日期 | 结果 |", "|---|---|"]
+        + [f"| {d} | {r} |" for d, r in rows]
+    )
     if failed:
         for date_str, err in failed:
             log(f"  失败 {date_str}: {err}")
