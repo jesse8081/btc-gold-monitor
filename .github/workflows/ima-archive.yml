@@ -1,0 +1,59 @@
+name: ima-archive
+
+# 贴水日报 → IMA 知识库归档。
+# 由 basis-daily 生成报告后自动触发，不需要本地电脑开机。
+on:
+  workflow_run:
+    workflows: ["basis-daily"]
+    types: [completed]
+  schedule:
+    # 兜底：workflow_run 没触发时，北京时间 16:30 再跑一次（去重是幂等的，重复跑不会产生重复条目）
+    - cron: "30 8 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      date:
+        description: "只归档指定日期 YYYY-MM-DD（留空=按 backfill 回补）"
+        required: false
+      backfill:
+        description: "回补最近 N 天里缺失的报告"
+        required: false
+        default: "5"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ima-archive
+  cancel-in-progress: false
+
+jobs:
+  archive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 拉取仓库（含当日报告）
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 1
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 归档到 IMA
+        env:
+          IMA_CLIENT_ID: ${{ secrets.IMA_CLIENT_ID }}
+          IMA_API_KEY: ${{ secrets.IMA_API_KEY }}
+          IMA_KB_NAME: 投资
+          IN_DATE: ${{ inputs.date }}
+          IN_BACKFILL: ${{ inputs.backfill }}
+        run: |
+          if [ -n "$IN_DATE" ]; then
+            ARGS="--date $IN_DATE"
+          else
+            ARGS="--backfill ${IN_BACKFILL:-5}"
+          fi
+          echo "运行参数: $ARGS"
+          python scripts/ima_archive.py $ARGS
