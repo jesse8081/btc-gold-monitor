@@ -74,7 +74,7 @@ def px():
 
 def hook():
     k = os.environ.get("SERVERCHAN_KEY", "").strip()
-    return f"https://sctapi.ftqq.com/{k}.send" if k else ""
+    return f"https://www.pushplus.plus/send?token={k}" if k else ""
 
 
 def push(t, b):
@@ -86,7 +86,7 @@ def push(t, b):
     if not u:
         return
     try:
-        requests.post(u, data={"title": t, "desp": b}, timeout=10)
+        requests.post(u, data={"title": t, "content": b, "template": "txt"}, timeout=10)
     except Exception as e:
         print("push fail", e, file=sys.stderr)
 
