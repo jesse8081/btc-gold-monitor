@@ -89,7 +89,7 @@ def save(s):
 
 
 def main():
-        push("测试", "GitHub Actions 通道测试")
+    push("测试", "GitHub Actions 通道测试")
     s = load()
     now = datetime.now()
     d = now.strftime("%Y-%m-%d")
